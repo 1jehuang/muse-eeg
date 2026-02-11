@@ -612,6 +612,7 @@ class MuseWindow(QMainWindow):
         self.blink_count = 0
         self.blink_start_time = time.time()
         self._blink_filter_b, self._blink_filter_a = butter(4, [1 / (EEG_RATE/2), 10 / (EEG_RATE/2)], btype="band")
+        self._last_blink_time = 0  # timestamp of last detected blink
         self._sp_update_counter = 0
 
         # IMU row
@@ -728,19 +729,24 @@ class MuseWindow(QMainWindow):
         except:
             pass
 
-        # Blink detection from frontal average (last 1 second)
+        # Blink detection — only look at the most recent ~100ms of new data
+        # Use a simple peak-in-recent-window approach with refractory period
         valid_f = ~np.isnan(af7) & ~np.isnan(af8)
-        if valid_f.sum() > 256:
-            frontal = (af7[valid_f][-256:] + af8[valid_f][-256:]) / 2
-            try:
-                filtered = filtfilt(self._blink_filter_b, self._blink_filter_a, frontal)
-                abs_sig = np.abs(filtered)
-                from scipy.signal import find_peaks
-                peaks, _ = find_peaks(abs_sig, height=BLINK_THRESHOLD, distance=int(EEG_RATE * 0.3))
-                if len(peaks) > 0:
-                    self.blink_count += len(peaks)
-            except:
-                pass
+        if valid_f.sum() > 64:
+            # Look at last 0.25 seconds only (64 samples)
+            recent_af7 = af7[valid_f][-64:]
+            recent_af8 = af8[valid_f][-64:]
+            frontal = (recent_af7 + recent_af8) / 2
+
+            # Simple threshold: raw absolute deviation from mean
+            deviation = np.abs(frontal - np.mean(frontal))
+            peak_val = np.max(deviation)
+
+            now = time.time()
+            # Refractory period: 0.4 seconds between blinks
+            if peak_val > BLINK_THRESHOLD and (now - self._last_blink_time) > 0.4:
+                self.blink_count += 1
+                self._last_blink_time = now
 
         elapsed = time.time() - self.blink_start_time
         rate = self.blink_count / elapsed * 60 if elapsed > 5 else 0
