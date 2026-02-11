@@ -340,26 +340,36 @@ class MuseBLE:
 
     async def _connect_phase1(self):
         """Phase 1: connect, halt, disconnect to wake up GATT table."""
-        client = BleakClient(self.address, timeout=15.0)
+        client = BleakClient(self.address, timeout=10.0)
         try:
             await client.connect()
             await client.start_notify(CONTROL, self._ctrl_handler)
             await asyncio.sleep(0.1)
             await client.write_gatt_char(CONTROL, cmd("h"), response=False)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.2)
         finally:
             try:
                 await client.disconnect()
             except:
                 pass
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(1.0)
 
-    async def _connect_phase2(self) -> BleakClient:
-        """Phase 2: reconnect and subscribe to all sensors."""
-        client = BleakClient(self.address, timeout=15.0)
+    async def _connect_and_stream(self) -> BleakClient:
+        """Connect and start streaming. Does phase 1 only if needed."""
+        client = BleakClient(self.address, timeout=10.0)
         await client.connect()
 
         available = {c.uuid for svc in client.services for c in svc.characteristics}
+        eeg_available = any(uuid in available for uuid in EEG_UUIDS)
+
+        if not eeg_available:
+            self.data.status = "Waking GATT table..."
+            await client.disconnect()
+            await self._connect_phase1()
+            client = BleakClient(self.address, timeout=10.0)
+            await client.connect()
+            available = {c.uuid for svc in client.services for c in svc.characteristics}
+
         await client.start_notify(CONTROL, self._ctrl_handler)
 
         for uuid, ch in EEG_UUIDS.items():
@@ -373,7 +383,7 @@ class MuseBLE:
             await client.start_notify(TELEM_UUID, self._telem_handler)
 
         await client.write_gatt_char(CONTROL, cmd("p21"), response=False)
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.2)
         await client.write_gatt_char(CONTROL, cmd("d"), response=False)
         return client
 
@@ -390,18 +400,16 @@ class MuseBLE:
                     self.data.status = f"Connecting (attempt {attempt}/{MAX_RETRIES})..."
 
                     try:
-                        await self._connect_phase1()
+                        client = await self._connect_and_stream()
                         break
                     except Exception as e:
-                        self.data.status = f"Phase 1 failed: {e}"
+                        self.data.status = f"Connect failed: {e}"
                         wait = min(attempt * 2, 10)
                         await asyncio.sleep(wait)
                 else:
                     self.data.status = "Could not connect. Power cycle Muse and restart."
                     return
 
-                self.data.status = "Connecting (phase 2)..."
-                client = await self._connect_phase2()
                 self.data.connected = True
                 self.data.status = "Streaming"
 
