@@ -14,8 +14,10 @@ import argparse
 import asyncio
 import csv
 import datetime
+import json
 import os
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -168,6 +170,110 @@ class DataLogger:
         return self.session_dir
 
 
+class FocusTracker:
+    """Tracks niri window focus in a background thread."""
+
+    def __init__(self, session_dir: str):
+        self.session_dir = session_dir
+        self.current_app = ""
+        self.current_title = ""
+        self.current_category = ""
+        self._stop = False
+        self._windows = {}
+        self._last_focused_id = None
+
+        self.focus_path = os.path.join(session_dir, "focus.csv")
+        self._file = open(self.focus_path, "w", newline="", buffering=1)
+        self._writer = csv.writer(self._file)
+        self._writer.writerow(["timestamp", "window_id", "app_id", "title", "workspace_id", "category"])
+        self._file.flush()
+
+    @staticmethod
+    def categorize(title: str, app_id: str) -> str:
+        t = (title or "").lower()
+        a = (app_id or "").lower()
+        if any(k in t for k in ["chinese", "chin", "pinyin", "hanzi", "lesson", "dictation",
+                                 "cumulative", "character-sheet", "textbook", "dialogue",
+                                 "listening", "radical", "tone", "quiz"]):
+            return "chinese_learning"
+        if "firefox" in a or "chromium" in a:
+            if any(k in t for k in ["github", "stackoverflow", "docs"]):
+                return "coding_ref"
+            if any(k in t for k in ["youtube", "reddit", "twitter", "news"]):
+                return "media"
+            return "browsing"
+        if a in ("kitty", "foot", "footclient", "alacritty", "wezterm"):
+            if any(k in t for k in ["code", "codex", "jcode", "claude", "nvim", "vim", "helix"]):
+                return "coding"
+            return "terminal"
+        if "code" in a or "cursor" in a:
+            return "coding"
+        if "muse" in t or "eeg" in t:
+            return "eeg_monitor"
+        return "other"
+
+    def _log(self, wid, app_id, title, workspace):
+        cat = self.categorize(title, app_id)
+        self.current_app = app_id or ""
+        self.current_title = title or ""
+        self.current_category = cat
+        self._writer.writerow([f"{time.time():.6f}", wid, app_id, title, workspace, cat])
+
+    def _run(self):
+        try:
+            r = subprocess.run(["niri", "msg", "-j", "focused-window"],
+                               capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                w = json.loads(r.stdout)
+                self._log(w.get("id"), w.get("app_id"), w.get("title"), w.get("workspace_id"))
+                self._last_focused_id = w.get("id")
+        except:
+            pass
+
+        proc = subprocess.Popen(["niri", "msg", "-j", "event-stream"],
+                                stdout=subprocess.PIPE, text=True)
+        try:
+            for line in proc.stdout:
+                if self._stop:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if "WindowsChanged" in event:
+                    for w in event["WindowsChanged"].get("windows", []):
+                        self._windows[w["id"]] = w
+
+                if "WindowFocusChanged" in event:
+                    wid = event["WindowFocusChanged"].get("id")
+                    if wid is not None and wid != self._last_focused_id:
+                        self._last_focused_id = wid
+                        w = self._windows.get(wid, {})
+                        self._log(wid, w.get("app_id"), w.get("title"), w.get("workspace_id"))
+
+                if "WindowOpenedOrChanged" in event:
+                    w = event["WindowOpenedOrChanged"].get("window", {})
+                    if w:
+                        self._windows[w["id"]] = w
+                        if w["id"] == self._last_focused_id and w.get("is_focused"):
+                            self._log(w["id"], w.get("app_id"), w.get("title"), w.get("workspace_id"))
+        finally:
+            proc.terminate()
+            self._file.close()
+
+    def start(self):
+        t = threading.Thread(target=self._run, daemon=True)
+        t.start()
+        return t
+
+    def stop(self):
+        self._stop = True
+
+
 class MuseData:
     def __init__(self):
         self.eeg = {ch: RingBuffer(EEG_BUF_LEN) for ch in ["TP9", "AF7", "AF8", "TP10"]}
@@ -178,6 +284,7 @@ class MuseData:
         self.connected = False
         self.status = "Disconnected"
         self.logger: DataLogger | None = None
+        self.focus: FocusTracker | None = None
 
 
 class MuseBLE:
@@ -372,6 +479,12 @@ class MuseWindow(QMainWindow):
         status_layout.addWidget(self.pps_label)
         layout.addLayout(status_layout)
 
+        # Focus bar
+        self.focus_label = QLabel("🪟 —")
+        self.focus_label.setFont(QFont("monospace", 10))
+        self.focus_label.setStyleSheet("color: #b0bec5; padding: 2px 4px; background: #2a2a2a; border-radius: 3px;")
+        layout.addWidget(self.focus_label)
+
         # Pre-compute x axes
         self.x_eeg = np.linspace(-EEG_WINDOW, 0, EEG_BUF_LEN)
         self.x_imu = np.linspace(-IMU_WINDOW, 0, IMU_BUF_LEN)
@@ -449,6 +562,24 @@ class MuseWindow(QMainWindow):
             self.last_packet_count = self.data.packet_count
             self.last_pps_time = now
 
+        if self.data.focus and self.data.focus.current_title:
+            cat = self.data.focus.current_category
+            cat_colors = {
+                "chinese_learning": "#ff7043",
+                "coding": "#42a5f5",
+                "terminal": "#78909c",
+                "browsing": "#ab47bc",
+                "media": "#ec407a",
+                "coding_ref": "#26a69a",
+                "eeg_monitor": "#66bb6a",
+            }
+            c = cat_colors.get(cat, "#b0bec5")
+            title = self.data.focus.current_title
+            if len(title) > 60:
+                title = title[:57] + "..."
+            self.focus_label.setText(f"🪟 [{cat}] {self.data.focus.current_app} — {title}")
+            self.focus_label.setStyleSheet(f"color: {c}; padding: 2px 4px; background: #2a2a2a; border-radius: 3px;")
+
         for ch, curve in self.eeg_curves.items():
             curve.setData(self.x_eeg, self.data.eeg[ch].get_ordered())
 
@@ -485,6 +616,7 @@ def main():
     data = MuseData()
     if not args.no_log:
         data.logger = DataLogger()
+        data.focus = FocusTracker(data.logger.session_dir)
         print(f"Logging to: {data.logger.path}")
     ble = MuseBLE(address, data)
 
@@ -496,9 +628,13 @@ def main():
     window.show()
 
     ble_thread = ble.run_in_thread()
+    if data.focus:
+        data.focus.start()
 
     def on_close():
         ble.stop()
+        if data.focus:
+            data.focus.stop()
         ble_thread.join(timeout=5)
         if data.logger:
             data.logger.close()
