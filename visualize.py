@@ -446,11 +446,12 @@ class MuseBLE:
         self.data.status = "Disconnected"
 
     def run_in_thread(self):
+        self._loop = None
         def target():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
             try:
-                loop.run_until_complete(self._run())
+                self._loop.run_until_complete(self._run())
             except Exception as e:
                 self.data.status = f"Error: {e}"
                 self.data.connected = False
@@ -460,6 +461,16 @@ class MuseBLE:
 
     def stop(self):
         self._stop = True
+
+    def force_disconnect(self):
+        """Force BLE disconnect via bluetoothctl as last resort."""
+        try:
+            subprocess.run(
+                ["bluetoothctl", "disconnect", self.address],
+                capture_output=True, timeout=3,
+            )
+        except:
+            pass
 
 
 class MuseWindow(QMainWindow):
@@ -817,7 +828,11 @@ def main():
         ble.stop()
         if data.focus:
             data.focus.stop()
-        ble_thread.join(timeout=5)
+        ble_thread.join(timeout=3)
+        if ble_thread.is_alive():
+            ble.force_disconnect()
+        else:
+            ble.force_disconnect()
         if data.logger:
             data.logger.close()
             print(f"\nData saved to: {data.logger.path}")
