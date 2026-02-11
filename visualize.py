@@ -23,8 +23,9 @@ import threading
 import time
 
 import numpy as np
+from scipy.signal import welch, butter, filtfilt
 import pyqtgraph as pg
-from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel
+from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QFont
 from bleak import BleakClient, BleakScanner
@@ -51,6 +52,16 @@ IMU_BUF_LEN = IMU_RATE * IMU_WINDOW  # 260
 EEG_SCALE = 1000.0 / 2048.0
 EEG_COLORS = ["#4fc3f7", "#81c784", "#ffb74d", "#e57373"]
 IMU_COLORS = ["#ef5350", "#66bb6a", "#42a5f5"]
+
+BANDS = {
+    "delta": (0.5, 4),
+    "theta": (4, 8),
+    "alpha": (8, 13),
+    "beta":  (13, 30),
+    "gamma": (30, 50),
+}
+BAND_COLORS = ["#9575cd", "#4fc3f7", "#66bb6a", "#ffb74d", "#ef5350"]
+BLINK_THRESHOLD = 150  # µV
 
 
 def cmd(s: str) -> bytes:
@@ -448,7 +459,7 @@ class MuseWindow(QMainWindow):
         super().__init__()
         self.data = data
         self.setWindowTitle("Muse S — Live Signals")
-        self.resize(1200, 900)
+        self.resize(1400, 1050)
 
         pg.setConfigOptions(antialias=False, background="#1e1e1e", foreground="#e0e0e0")
         pg.setConfigOption("useOpenGL", True)
@@ -504,6 +515,85 @@ class MuseWindow(QMainWindow):
             curve = pw.plot(pen=pg.mkPen(EEG_COLORS[i], width=1.2))
             self.eeg_curves[ch] = curve
             layout.addWidget(pw)
+
+        # --- Signal processing row ---
+        sp_layout = QHBoxLayout()
+
+        # Band power bar chart (TP9 average)
+        self.band_plot = pg.PlotWidget(title="Band Power (TP9)")
+        self.band_plot.setLabel("left", "dB")
+        self.band_plot.setYRange(-10, 40)
+        self.band_plot.showGrid(y=True, alpha=0.15)
+        self.band_plot.setMinimumHeight(140)
+        self.band_plot.getAxis("bottom").setTicks(
+            [[(i, name) for i, name in enumerate(BANDS.keys())]]
+        )
+        self.band_bars = pg.BarGraphItem(
+            x=list(range(len(BANDS))),
+            height=[0] * len(BANDS),
+            width=0.6,
+            brushes=[pg.mkBrush(c) for c in BAND_COLORS],
+        )
+        self.band_plot.addItem(self.band_bars)
+        sp_layout.addWidget(self.band_plot)
+
+        # Alpha asymmetry gauge
+        self.asym_plot = pg.PlotWidget(title="Alpha Asymmetry")
+        self.asym_plot.setLabel("left", "ln(R)-ln(L)")
+        self.asym_plot.setYRange(-2, 2)
+        self.asym_plot.setXRange(-30, 0)
+        self.asym_plot.showGrid(x=True, y=True, alpha=0.15)
+        self.asym_plot.setMinimumHeight(140)
+        self.asym_plot.addLine(y=0, pen=pg.mkPen("#555", width=1, style=Qt.PenStyle.DashLine))
+        self.asym_curve = self.asym_plot.plot(pen=pg.mkPen("#ab47bc", width=2))
+        self.asym_fill_pos = pg.FillBetweenItem(
+            self.asym_curve, self.asym_plot.plot([0], [0], pen=pg.mkPen(None)),
+            brush=pg.mkBrush(102, 187, 106, 60),
+        )
+        self.asym_plot.addItem(self.asym_fill_pos)
+        self.asym_history = RingBuffer(30)  # 30 data points, ~1/sec
+        sp_layout.addWidget(self.asym_plot)
+
+        # Blink + stats panel
+        stats_widget = QWidget()
+        stats_layout = QVBoxLayout(stats_widget)
+        stats_layout.setContentsMargins(8, 4, 8, 4)
+
+        self.blink_label = QLabel("👁 Blinks: 0")
+        self.blink_label.setFont(QFont("monospace", 14, QFont.Weight.Bold))
+        self.blink_label.setStyleSheet("color: #4fc3f7;")
+        self.blink_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        stats_layout.addWidget(self.blink_label)
+
+        self.blink_rate_label = QLabel("0/min")
+        self.blink_rate_label.setFont(QFont("monospace", 11))
+        self.blink_rate_label.setStyleSheet("color: #78909c;")
+        self.blink_rate_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        stats_layout.addWidget(self.blink_rate_label)
+
+        self.asym_label = QLabel("α Asym: —")
+        self.asym_label.setFont(QFont("monospace", 12))
+        self.asym_label.setStyleSheet("color: #ab47bc;")
+        self.asym_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        stats_layout.addWidget(self.asym_label)
+
+        self.dominant_label = QLabel("")
+        self.dominant_label.setFont(QFont("monospace", 10))
+        self.dominant_label.setStyleSheet("color: #78909c;")
+        self.dominant_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        stats_layout.addWidget(self.dominant_label)
+
+        stats_widget.setMinimumHeight(140)
+        stats_widget.setMaximumWidth(180)
+        stats_widget.setStyleSheet("background: #2a2a2a; border-radius: 4px;")
+        sp_layout.addWidget(stats_widget)
+        layout.addLayout(sp_layout)
+
+        # Blink detection state
+        self.blink_count = 0
+        self.blink_start_time = time.time()
+        self._blink_filter_b, self._blink_filter_a = butter(4, [1 / (EEG_RATE/2), 10 / (EEG_RATE/2)], btype="band")
+        self._sp_update_counter = 0
 
         # IMU row
         imu_layout = QHBoxLayout()
@@ -562,6 +652,11 @@ class MuseWindow(QMainWindow):
             self.last_packet_count = self.data.packet_count
             self.last_pps_time = now
 
+        # --- Signal processing (every 5th frame = ~12 Hz) ---
+        self._sp_update_counter += 1
+        if self._sp_update_counter % 5 == 0:
+            self._update_signal_processing()
+
         if self.data.focus and self.data.focus.current_title:
             cat = self.data.focus.current_category
             cat_colors = {
@@ -588,6 +683,85 @@ class MuseWindow(QMainWindow):
 
         for ax, curve in self.gyro_curves.items():
             curve.setData(self.x_imu, self.data.gyro[ax].get_ordered())
+
+    def _update_signal_processing(self):
+        """Compute band powers, blinks, and alpha asymmetry."""
+        tp9 = self.data.eeg["TP9"].get_ordered()
+        tp10 = self.data.eeg["TP10"].get_ordered()
+        af7 = self.data.eeg["AF7"].get_ordered()
+        af8 = self.data.eeg["AF8"].get_ordered()
+
+        valid = ~np.isnan(tp9)
+        if valid.sum() < 256:
+            return
+
+        # Band powers from TP9 (last 2 seconds)
+        seg = tp9[valid][-512:]
+        seg = seg - np.mean(seg)
+        try:
+            freqs, psd = welch(seg, fs=EEG_RATE, nperseg=min(256, len(seg)))
+            heights = []
+            for lo, hi in BANDS.values():
+                mask = (freqs >= lo) & (freqs <= hi)
+                power = np.mean(psd[mask]) if mask.any() else 1e-10
+                heights.append(10 * np.log10(power + 1e-10))
+            self.band_bars.setOpts(height=heights)
+        except:
+            pass
+
+        # Blink detection from frontal average (last 1 second)
+        valid_f = ~np.isnan(af7) & ~np.isnan(af8)
+        if valid_f.sum() > 256:
+            frontal = (af7[valid_f][-256:] + af8[valid_f][-256:]) / 2
+            try:
+                filtered = filtfilt(self._blink_filter_b, self._blink_filter_a, frontal)
+                abs_sig = np.abs(filtered)
+                from scipy.signal import find_peaks
+                peaks, _ = find_peaks(abs_sig, height=BLINK_THRESHOLD, distance=int(EEG_RATE * 0.3))
+                if len(peaks) > 0:
+                    self.blink_count += len(peaks)
+            except:
+                pass
+
+        elapsed = time.time() - self.blink_start_time
+        rate = self.blink_count / elapsed * 60 if elapsed > 5 else 0
+        self.blink_label.setText(f"👁 Blinks: {self.blink_count}")
+        self.blink_rate_label.setText(f"{rate:.0f}/min" if elapsed > 5 else "measuring...")
+
+        # Alpha asymmetry
+        valid_lr = ~np.isnan(tp9) & ~np.isnan(tp10)
+        if valid_lr.sum() > 512:
+            left = tp9[valid_lr][-512:]
+            right = tp10[valid_lr][-512:]
+            left = left - np.mean(left)
+            right = right - np.mean(right)
+            try:
+                fl, pl = welch(left, fs=EEG_RATE, nperseg=256)
+                fr, pr = welch(right, fs=EEG_RATE, nperseg=256)
+                alpha_mask = (fl >= 8) & (fl <= 13)
+                la = np.mean(pl[alpha_mask]) if alpha_mask.any() else 1e-10
+                ra = np.mean(pr[alpha_mask]) if alpha_mask.any() else 1e-10
+                asym = float(np.log(ra + 1e-10) - np.log(la + 1e-10))
+                self.asym_history.extend([asym])
+
+                hist = self.asym_history.get_ordered()
+                valid_h = ~np.isnan(hist)
+                if valid_h.sum() > 1:
+                    x_asym = np.linspace(-30, 0, len(hist))
+                    self.asym_curve.setData(x_asym[valid_h], hist[valid_h])
+
+                self.asym_label.setText(f"α Asym: {asym:+.2f}")
+                if asym > 0.2:
+                    self.dominant_label.setText("→ Right dominant")
+                    self.dominant_label.setStyleSheet("color: #66bb6a;")
+                elif asym < -0.2:
+                    self.dominant_label.setText("← Left dominant")
+                    self.dominant_label.setStyleSheet("color: #ef5350;")
+                else:
+                    self.dominant_label.setText("≈ Balanced")
+                    self.dominant_label.setStyleSheet("color: #78909c;")
+            except:
+                pass
 
 
 async def find_muse(timeout=10.0):
